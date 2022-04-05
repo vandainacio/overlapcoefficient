@@ -1,0 +1,243 @@
+require(pracma)
+require(nor1mix)
+
+dpm <- function(y, prior, mcmc, standardise = FALSE) {
+  
+  multinom <- function(probs) {
+    probs <- t(apply(probs,1,cumsum))
+    res <- rowSums(probs - runif(nrow(probs)) < 0) + 1
+    return(res) 
+  }
+  
+  n <- length(y)
+  yt <- y
+  if(standardise) {
+    yt <- (y-mean(y))/sd(y)
+  }
+  
+  m0 <- prior$m0
+  S0 <- prior$S0
+  a <- prior$a
+  b <- prior$b
+  alpha <- prior$alpha
+  L <- prior$L
+  
+  nburn <- mcmc$nburn
+  nsave <- mcmc$nsave
+  nskip <- mcmc$nskip
+  nsim <- nsave*nskip+nburn
+  
+  p <- ns <- rep(0,L)
+  v <- rep(1/L,L)
+  v[L] <- 1
+  
+  prop <- matrix(NA_real_, nrow = n, ncol = L)
+  
+  z <- matrix(NA_real_, nrow = nsim, ncol = n)
+  z_tmp <- vector(length = n)
+  
+  z[1,] <- rep(1,n)
+  
+  P <- Mu <- Sigma2 <- matrix(0, nrow = nsim, ncol = L)
+  
+  Mu_tmp <- Sigma2_tmp  <- vector(length = L)
+  
+  Mu[1,] <- rep(mean(yt), L)
+  Sigma2[1,] <- rep(var(yt), L)
+  
+  Mu_tmp <- Mu[1,]
+  Sigma2_tmp <- Sigma2[1,]
+  
+  for(i in 2:nsim) {
+    Sigma2_tmp <- Sigma2[i-1,]
+    
+    cumv <- cumprod(1-v)
+    p[1] <- v[1]
+    p[2:L] <- v[2:L]*cumv[1:(L-1)]
+    
+    for(l in 1:L){
+      prop[,l] <- p[l]*dnorm(yt, mean = Mu_tmp[l], sd = sqrt(Sigma2_tmp[l]))
+    }
+    prob <- prop/rowSums(prop)
+    
+    z_tmp <- multinom(prob)
+    ns <- sapply(1:L, function(x, v) sum(v == x), v = z_tmp)
+    yt_z_l <- sapply(1:L, function(x, v, y) sum(y[v == x]), v = z_tmp, y = yt)
+    
+    v[1:(L-1)] <- rbeta(L-1, 1 + ns[1:(L-1)], alpha + rev(cumsum(rev(ns[-1]))))
+    
+    varmu <- 1/((1/S0) + (ns/Sigma2_tmp))
+    meanmu <- ((yt_z_l/Sigma2_tmp) + (m0/S0))/((1/S0) + (ns/Sigma2_tmp))
+    Mu_tmp <- rnorm(L, mean = meanmu, sd = sqrt(varmu))
+    yt_z_l_mu <- sapply(1:L, function(x, v, y, mu) sum((y[v == x] - mu[x])^2), v = z_tmp, y = yt, mu = Mu_tmp)
+    
+    Sigma2_tmp <- 1/rgamma(L, a + ns/2, b + 0.5*yt_z_l_mu)
+    
+    P[i,] <- p
+    z[i,] <- z_tmp
+    Mu[i,] <- Mu_tmp
+    Sigma2[i,] <- Sigma2_tmp
+  }
+  if(standardise){
+    Mu <- sd(y)*Mu + mean(y)
+    Sigma2 <- var(y)*Sigma2
+  }
+  
+  res <- list()
+  res$z <- z[seq(nburn+1, nsim, by = nskip),]
+  res$P <- P[seq(nburn+1, nsim, by = nskip),]
+  res$Mu <- Mu[seq(nburn+1, nsim, by = nskip),]
+  res$Sigma2 <- Sigma2[seq(nburn+1, nsim, by = nskip),]
+  return(res)
+}
+
+ovl_dpm_bb <- function(y_d, y_bard, object_bard, object_d){
+  
+  niter <- nrow(object_bard$Mu) 
+  
+  coef_overlap <- numeric(niter)
+  for(l in 1:niter){
+    aux_dens_bard <- norMix(mu = object_bard$Mu[l,], sigma = sqrt(object_bard$Sigma2[l,]), w = object_bard$P[l,])
+    aux_dens_d <- norMix(mu = object_d$Mu[l,], sigma = sqrt(object_d$Sigma2[l,]), w = object_d$P[l,])
+    
+    u_bard <- dnorMix(x = y_bard, aux_dens_bard) - dnorMix(x = y_bard, aux_dens_d)
+    u_d <- dnorMix(x = y_d, aux_dens_bard) - dnorMix(x = y_d, aux_dens_d)
+    
+    aux_weights_bard <- rgamma(n = length(unique(u_bard)), shape = as.numeric(table(u_bard)), rate = 1)
+    weights_bard <- aux_weights_bard/sum(aux_weights_bard)
+    
+    aux_weights_d <- rgamma(n = length(unique(u_d)), shape = as.numeric(table(u_d)), rate = 1)
+    weights_d <- aux_weights_d/sum(aux_weights_d)
+    
+    cdf_u_bard <- sum(weights_bard * (sort(unique(u_bard)) < 0))
+    survival_u_d <- sum(weights_d * (sort(unique(u_d)) >= 0))
+    
+    coef_overlap[l] <- min(cdf_u_bard + survival_u_d, 1)
+  }
+  
+  return("overlap" = coef_overlap)
+}
+
+ovl_dpm_num_int <- function(y_d, y_bard, grid, object_bard, object_d, met = c(minimum, absolute)){
+  
+  niter <- nrow(object_bard$Mu)
+  coef_overlap <- numeric(niter)
+  
+  for(l in 1:niter){
+    aux_dens_bard <- norMix(mu = object_bard$Mu[l,], sigma = sqrt(object_bard$Sigma2[l,]), w = object_bard$P[l,])
+    aux_dens_d <- norMix(mu = object_d$Mu[l,], sigma = sqrt(object_d$Sigma2[l,]), w = object_d$P[l,])
+    
+    dens_bard <- dnorMix(x = grid, aux_dens_bard)
+    dens_d <- dnorMix(x = grid, aux_dens_d)
+    
+    if(met == "minimum"){
+      dens_min <- pmin(dens_bard, dens_d)
+      coef_overlap[l] <- trapz(grid, dens_min)
+    }
+    if(met == "absolute"){
+      dens_abs <- abs(dens_bard - dens_d)
+      coef_overlap[l] <- 1 - 0.5*trapz(grid, dens_abs)
+    }
+    }
+return("overlap" = coef_overlap)
+}
+
+ovl_kernel_num_int <- function(y_d, y_bard, grid,
+                               bw = c(srt, ucv),
+                               met = c(minimum, absolute),
+                               B = 0){
+  
+  compute.overlap <- function(y_d, y_bard, grid, bw){
+    lgrid <- length(grid)
+    
+    if(bw == "srt"){
+      dens_bard <- density(y_bard, from = lower, to = upper, n = lgrid)$y
+      dens_d <- density(y_d, from = lower, to = upper, n = lgrid)$y
+    }
+    if(bw == "ucv"){
+    dens_bard <- density(y_bard, bw = bw.ucv(y_bard),
+                         from = lower, to = upper, n = lgrid)$y
+    dens_d <- density(y_d, bw = bw.ucv(y_d),
+                      from = lower, to = upper, n = lgrid)$y
+    }
+ if(met == "minimum"){
+    dens_min <- pmin(dens_bard, dens_d)
+    
+    coef_overlap <- trapz(grid, dens_min)
+    }
+ if(met == "absolute"){
+     dens_abs <- abs(dens_bard - dens_d)
+     coef_overlap <- 1 - 0.5*trapz(grid, dens_abs)
+ }
+    return(coef_overlap)
+  }
+  overlap <- compute.overlap(y_d = y_d, y_bard = y_bard,
+                             lgrid = lgrid, bw = bw)
+  if(B > 0){
+    overlap_b <- numeric(B)
+    for(l in 1:B){
+      y_d_b <- sample(x = y_d, size = length(y_d), replace = TRUE)
+      y_bard_b <- sample(x = y_bard, size = length(y_bard), replace = TRUE)
+      overlap_b[l] <- compute.overlap(y_d = y_d_b, y_bard = y_bard_b,
+                                      lgrid = lgrid, bw = bw)
+    }
+  }
+  if(B > 0){
+    overlap_lq <- quantile(overlap_b, prob = 0.025)
+    overlap_uq <- quantile(overlap_b, prob = 0.975)
+  }
+  if(B == 0){
+    return(overlap)
+  }
+  else{return(list("est" = overlap,
+                   "ql" = overlap_lq, "qh" = overlap_uq))}
+}
+
+fker <- function(grid, y, bw = c(srt, ucv)){
+  n <- length(y)
+  if(bw == "srt"){
+    h <- bw.nrd0(y)
+  }
+  if(bw == "ucv"){
+    h <- bw.ucv(y)
+  }
+ dens <- numeric(length(grid))
+  for(j in 1:length(grid)){
+    dens[j] <- sum(dnorm((grid[j]-y)/h))/(n*h)
+  }
+  return(dens)
+}
+
+overlap_kernel_emp <- function(y_d, y_bard,
+                               bw = c(srt,ucv), B = 0){
+  
+  compute.overlap <- function(y_d, y_bard, bw){
+    fker_bard_bard <- fker(grid = y_bard, y = y_bard, bw = bw)
+    fker_d_bard <- fker(grid = y_bard, y = y_d, bw = bw)
+    fker_d_d <- fker(grid = y_d, y = y_d, bw = bw)
+    fker_bard_d <- fker(grid = y_d, y = y_bard, bw = bw)
+    
+    coef_overlap <- mean(fker_bard_bard < fker_d_bard) + mean(fker_d_d <= fker_bard_d)
+    return(coef_overlap)
+  }
+  
+  overlap <- compute.overlap(y_d = y_d, y_bard = y_bard, bw = bw)
+  
+  if(B > 0){
+    overlap_b <- numeric(B)
+    for(l in 1:B){
+      y_d_b <- sample(x = y_d, size = length(y_d), replace = TRUE)
+      y_bard_b <- sample(x = y_bard, size = length(y_bard), replace = TRUE)
+      overlap_b[l] <- compute.overlap(y_d = y_d_b, y_bard = y_bard_b, bw = bw)
+    }
+  }
+  if(B > 0){
+    overlap_lq <- quantile(overlap_b, prob = 0.025)
+    overlap_uq <- quantile(overlap_b, prob = 0.975)
+  }
+  if(B == 0){
+    return(overlap)
+  }
+  else{return(list("est" = overlap,
+                   "ql" = overlap_lq, "qh" = overlap_uq))}
+}
